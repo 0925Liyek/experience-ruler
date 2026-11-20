@@ -1,100 +1,396 @@
-import gradio as gr
+# -*- coding: utf-8 -*-
+"""经验尺 · MVP（Gradio 6 适配版）
+运行：py app.py
+配置：复制 .env.example 为 .env，填入两个 Key
+"""
+
+import json
 import os
+import re
 import time
+
+import gradio as gr
 import requests
 from dotenv import load_dotenv
 
-# 加载 .env 文件里的密钥
 load_dotenv()
-zhihu_secret = os.getenv("ZHIHU_ACCESS_SECRET")
-deepseek_key = os.getenv("DEEPSEEK_API_KEY")
 
-# 1. 抓知乎内容（升级版：动态搜索 + 挑最长的一篇）
-def fetch_zhihu_post(query):
-    url = "https://developer.zhihu.com/api/v1/content/zhihu_search"
-    headers = {
-        "Authorization": f"Bearer {zhihu_secret}",
-        "X-Request-Timestamp": str(int(time.time())),
-        "Content-Type": "application/json"
-    }
-    # 搜索 5 条，从中挑内容最全的
-    params = {"Query": f"{query} 经验", "Count": 5}
+ZHIHU_SECRET = os.getenv("ZHIHU_ACCESS_SECRET", "")
+DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+
+ZHIHU_HOST = "https://developer.zhihu.com"
+ZHIHU_SEARCH_PATH = "/api/v1/content/zhihu_search"
+DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
+
+CONNECT_TIMEOUT = 5       # 连接超时（秒）
+READ_TIMEOUT = 45         # 读取超时（秒）—— 现场卡死的第一元凶就是不设它
+MAX_POST_CHARS = 8000     # 送进模型的正文上限
+DEMO_MODE = os.getenv("DEMO_MODE", "0") == "1"   # 1 = 跳过真实调用，走缓存/内置样例
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".demo_cache.json")
+
+
+# ============================================================
+# 0. 小工具
+# ============================================================
+def _first(d, keys, default=""):
+    """防御式取字段：不确定 API 到底给哪个键名时用。"""
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return default
+
+
+def _bar(score):
+    score = max(0, min(100, int(score or 0)))
+    filled = int(round(score / 10))
+    return "█" * filled + "░" * (10 - filled)
+
+
+def _parse_json(text):
+    """模型偶尔会套 ```json 代码块或多写解释，这里容错。"""
+    t = (text or "").strip()
+    t = re.sub(r"^```(?:json)?|```$", "", t, flags=re.M).strip()
     try:
-        resp = requests.get(url, headers=headers, params=params)
-        items = resp.json().get("Data", {}).get("Items", [])
-        if items:
-            # 按照 ContentText 长度排序，取最长的
-            items.sort(key=lambda x: len(x.get('ContentText', '')), reverse=True)
-            best_post = items[0].get('ContentText', '')
-            return best_post
-    except Exception as e:
-        print(f"抓取报错: {e}")
-    return "抓取失败，请手动粘贴内容。"
+        return json.loads(t)
+    except Exception:
+        pass
+    start, end = t.find("{"), t.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(t[start:end + 1])
+        except Exception:
+            return None
+    return None
 
-# 2. 核心诊断逻辑（升级版：优化的 Prompt）
-# 2. 核心诊断逻辑（升级版：带有思考提示）
-def diagnose(identity, constraint, goal, post_text):
-    if not post_text.strip():
-        # 如果没有输入，直接返回警告
-        yield "⚠️ 请先粘贴一条知乎经验帖正文！"
-        return
-        
-    # 【新增】第一步：立刻返回思考提示
-    yield "⏳ **AI 正在深度诊断中，请稍候...**\n\n*(正在提取隐性条件并对比你的处境，通常需要 5-10 秒，请不要重复点击)*"
-        
-    system_prompt = """你是一个“经验适用性诊断器”。请对比用户情况和经验帖，输出四个区块：
-【✅ 可参考】：说明理由。
-【⚠️ 需警惕】：说明在什么条件下会失效。
-【❌ 不适用】：说明照搬会出什么问题。
-【🔍 必须验证】：用户需要去查证的一个具体问题。
 
-注意：
-1. 原文可能因为抓取原因缺乏上下文连贯性，请根据常理推断其真实表达。
-2. 必须严格输出这四个区块，使用 Markdown 格式排版，分点说明，语气客观理性。"""
+def _cache_save(data):
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
-    user_message = f"用户身份：{identity}\n目标：{goal}\n约束：{constraint}\n\n帖子正文：\n{post_text}"
-    
-    url = "https://api.deepseek.com/chat/completions"
-    headers = {"Authorization": f"Bearer {deepseek_key}", "Content-Type": "application/json"}
+
+def _cache_load():
+    try:
+        with open(CACHE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+# ============================================================
+# 1. 抓知乎：先返回候选列表，再挑一条
+# ============================================================
+def _zhihu_headers():
+    return {
+        "Authorization": f"Bearer {ZHIHU_SECRET}",
+        "X-Request-Timestamp": str(int(time.time())),
+        "Content-Type": "application/json",
+    }
+
+
+def zhihu_candidates(query, count=5):
+    """返回 [{title, text}, ...]，按正文长度降序。"""
+    resp = requests.get(
+        ZHIHU_HOST + ZHIHU_SEARCH_PATH,
+        headers=_zhihu_headers(),
+        params={"Query": f"{query} 经验", "Count": count},
+        timeout=(CONNECT_TIMEOUT, 20),
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"知乎接口 HTTP {resp.status_code}：{resp.text[:150]}")
+
+    payload = resp.json()
+    items = (payload.get("Data") or {}).get("Items") or []
+    if not items:
+        raise RuntimeError("知乎返回 0 条结果，换个关键词试试。")
+
+    out = []
+    for it in items:
+        out.append({
+            "title": _first(it, ("Title", "TitleText", "QuestionTitle", "Name")),
+            "text": _first(it, ("ContentText", "Content", "Text", "Excerpt")),
+        })
+    out.sort(key=lambda x: len(x["text"]), reverse=True)
+    return out
+
+
+# ============================================================
+# 2. 诊断：两段式 Prompt → JSON → 卡片
+# ============================================================
+SYSTEM_PROMPT = """你是「经验尺」的诊断引擎。你的唯一任务：把一条知乎经验帖里【没有明写、但决定这条经验能否成立】的隐性前提挖出来，再逐条比对用户的处境。禁止泛泛评价帖子好坏，禁止复述帖子内容。
+
+第一步：只提取，不评价。从原文提取 3-6 条隐性前提，每条包含：
+- type：时间 / 资金 / 学历 / 地域 / 家庭 / 体力 / 信息差 / 窗口期 / 政策 / 健康（选一个最贴近的）
+- claim：这条经验成立所依赖的隐含条件（≤40字，写成陈述句）
+- evidence：原文中支持它的具体信号（≤50字）；若原文确实没写，就写"原文未提及，由常识推断"
+- if_miss：用户不具备这个条件时，照搬会出现的具体后果（≤40字）
+
+第二步：逐条匹配。用用户的身份/目标/约束判定每条：
+- "满足"：用户处境明确满足
+- "不满足"：明确不满足
+- "未知"：用户没提供相关信息。这是重要结论，不要猜测，不要默认满足。
+并给出 why（≤30字的判断理由）。
+
+第三步：汇总。
+- score：0-100，这条经验对【当前这位用户】的可迁移度
+- verdict：一句话结论，直接说能不能照搬（≤30字）
+- quadrants：reference（可参考）/ caution（需警惕）/ invalid（不适用）/ verify（必须验证），各 1-3 条，每条 ≤40 字
+- must_verify：用户现在就能去查证的一个具体问题（≤40字）
+
+约束：
+1. 原文来自 API 抓取，可能缺排版甚至有截断，请按常理推断真实表达，但不要补造原文没有的事实。
+2. 若帖子明显是软广 / 带货 / 引流，在 verdict 里直接点明。
+3. 只输出 JSON，不要 markdown 代码块，不要任何解释文字。结构：
+{"score":0,"verdict":"","premises":[{"type":"","claim":"","evidence":"","if_miss":"","match":"满足","why":""}],"quadrants":{"reference":[],"caution":[],"invalid":[],"verify":[]},"must_verify":""}"""
+
+
+def build_user_message(identity, goal, constraint, post):
+    return (
+        f"用户身份：{identity}\n"
+        f"用户目标：{goal}\n"
+        f"用户约束：{constraint}\n\n"
+        f"帖子正文（可能不连贯）：\n{post}"
+    )
+
+
+def call_deepseek(system_prompt, user_message, retries=1):
+    if not DEEPSEEK_KEY:
+        raise RuntimeError("没读到 DEEPSEEK_API_KEY（检查 .env 是否存在且格式正确）")
+
     data = {
         "model": "deepseek-chat",
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
+            {"role": "user", "content": user_message},
         ],
-        "temperature": 0.2
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
     }
-    
-    try:
-        resp = requests.post(url, headers=headers, json=data)
-        result_text = resp.json()["choices"][0]["message"]["content"]
-        # 【新增】第二步：拿到结果后，替换掉思考提示，输出最终结果
-        yield result_text
-    except Exception as e:
-        yield f"❌ 诊断失败，请检查网络或 Key：{e}"
+    headers = {"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"}
 
-# 3. Gradio 界面（升级版：按钮动态传参）
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.post(DEEPSEEK_URL, headers=headers, json=data,
+                                 timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+            if resp.status_code != 200:
+                raise RuntimeError(f"DeepSeek HTTP {resp.status_code}：{resp.text[:150]}")
+            return resp.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(1.5)
+    raise last_err
+
+
+MATCH_ICON = {"满足": "✅ 满足", "不满足": "❌ 不满足", "未知": "❓ 未知"}
+
+
+def render_report(d, truncated=False, source=""):
+    lines = []
+    score = int(d.get("score") or 0)
+    lines.append(f"### 匹配度 {score}/100　`{_bar(score)}`")
+    if d.get("verdict"):
+        lines.append(f"> **{d['verdict']}**")
+    lines.append("")
+    lines.append("#### 🔍 隐性前提清单（这条经验没写出来的部分）")
+
+    premises = d.get("premises") or []
+    if not premises:
+        lines.append("_模型未返回前提条目_")
+    for i, p in enumerate(premises, 1):
+        icon = MATCH_ICON.get(p.get("match") or "未知", "❓ 未知")
+        lines.append(f"**{i}. [{p.get('type', '其他')}] {p.get('claim', '')}**　{icon}")
+        if p.get("evidence"):
+            lines.append(f"- 原文依据：{p['evidence']}")
+        if p.get("why"):
+            lines.append(f"- 判断理由：{p['why']}")
+        if p.get("if_miss"):
+            lines.append(f"- 若不满足：{p['if_miss']}")
+        lines.append("")
+
+    q = d.get("quadrants") or {}
+    for key, title in (
+        ("reference", "✅ 可参考"),
+        ("caution", "⚠️ 需警惕"),
+        ("invalid", "❌ 不适用"),
+        ("verify", "🔍 必须验证"),
+    ):
+        items = q.get(key) or []
+        lines.append(f"#### {title}")
+        lines.extend([f"- {x}" for x in items] or ["- （无）"])
+        lines.append("")
+
+    if d.get("must_verify"):
+        lines.append("#### 🎯 你现在该去查的一件事")
+        lines.append(d["must_verify"])
+
+    foot = []
+    if truncated:
+        foot.append(f"⚠️ 原文超 {MAX_POST_CHARS} 字，只诊断了前 {MAX_POST_CHARS} 字")
+    if source:
+        foot.append(f"来源：{source}")
+    if foot:
+        lines.append("\n---\n" + "　·　".join(foot))
+    return "\n".join(lines)
+
+
+# 内置兜底样例（B 可以把这里替换成 3 个固定演示案例）
+FALLBACK_REPORT = {
+    "score": 45,
+    "verdict": "不能直接照搬，这篇的核心前提你不满足",
+    "premises": [
+        {"type": "时间", "claim": "作者是脱产全职备考，每天能投入 10 小时以上",
+         "evidence": "原文未提及，由常识推断", "if_miss": "在职每天 3 小时会被进度表直接拖垮",
+         "match": "不满足", "why": "你的约束写的是下班后 3 小时"},
+    ],
+    "quadrants": {
+        "reference": ["分阶段刷题的顺序可以照用"],
+        "caution": ["月度进度表依赖全职时间投入"],
+        "invalid": ["三刷真题的节奏照搬会崩"],
+        "verify": ["目标岗位近三年进面分数线"],
+    },
+    "must_verify": "这个岗位去年进面的人，在职备考的比例是多少？",
+}
+
+
+def diagnose(identity, goal, constraint, post_text):
+    """生成器：先出提示，再出结果；任何异常路径都必须有输出。"""
+    post = (post_text or "").strip()
+    if not post:
+        yield "⚠️ 还没有帖子正文。先点「① 获取帖子」，或直接把正文粘到下面的大框里。"
+        return
+
+    truncated = len(post) > MAX_POST_CHARS
+    post_for_model = post[:MAX_POST_CHARS]
+
+    yield ("⏳ **正在提取隐性前提，并逐条比对你的处境……**\n\n"
+           "通常 5–10 秒，请不要重复点击。")
+
+    try:
+        if DEMO_MODE:
+            raise RuntimeError("DEMO_MODE 已开启，跳过真实调用")
+        raw = call_deepseek(SYSTEM_PROMPT, build_user_message(identity, goal, constraint, post_for_model))
+        data = _parse_json(raw)
+        if not data:
+            raise ValueError("模型没有返回合法 JSON")
+        _cache_save(data)
+        yield render_report(data, truncated, "模型实时诊断")
+    except Exception as e:
+        cached = _cache_load()
+        if cached:
+            yield render_report(cached, truncated, f"⚠️ 实时诊断失败（{e}），已回退到上一次成功结果")
+        else:
+            yield render_report(FALLBACK_REPORT, truncated, f"⚠️ 实时诊断失败（{e}），已回退到内置示例")
+
+
+# ============================================================
+# 3. 界面（Gradio 6：theme 走 launch，Textbox 复制按钮用 buttons=["copy"]）
+# ============================================================
+def free_select(choices, value, label):
+    """可自由输入的下拉框。Gradio 6 没有 Combobox，用 Dropdown + allow_custom_value。"""
+    return gr.Dropdown(choices=choices, value=value, label=label, allow_custom_value=True)
+
+
 with gr.Blocks(title="经验尺") as demo:
-    gr.Markdown("## 📏 经验尺：这条经验，适合你的处境吗？")
-    gr.Markdown("帮你判断一条知乎经验帖里未写明的“隐性条件”，是否匹配你当下的处境。")
-    
+    gr.Markdown(
+        "# 📏 经验尺\n"
+        "**不问「这条经验好不好」，只问「它成立的前提，你符不符合」。**\n\n"
+        "① 填你的处境 → ② 取一条知乎经验帖 → ③ 拿到隐性前提清单与匹配诊断"
+    )
+
     with gr.Row():
-        identity = gr.Dropdown(["大三", "大四", "毕业1-3年", "在职"], label="当前身份", value="在职")
-        goal = gr.Dropdown(["考公", "考研", "转行", "求职"], label="目标", value="考公")
-        
-    constraint = gr.Textbox(label="核心约束", placeholder="例如：只能在职备考 / 本科双非 / 必须自己赚生活费", value="每天只能下班后学3小时，没有经济支持")
-    post_text = gr.Textbox(label="粘贴一条知乎经验帖正文（或点击下方按钮自动抓取）", lines=8)
-    
+        identity = free_select(["大三", "大四", "毕业1-3年", "在职"], "在职", "你的身份（可直接输入）")
+        goal = free_select(["考公", "考研", "转行", "求职"], "考公", "你的目标（可直接输入）")
+
+    constraint = gr.Textbox(
+        label="你的核心约束",
+        lines=2,
+        placeholder="例如：只能在职备考 / 本科双非 / 必须自己赚生活费",
+        value="每天只能下班后学 3 小时，没有经济支持",
+    )
+
+    gr.Markdown("---\n### ② 取一条经验帖")
+
     with gr.Row():
-        fetch_btn = gr.Button("🔍 根据【目标】自动抓取一篇相关帖子")
-        btn = gr.Button("🚀 诊断这条经验适不适合我", variant="primary")
-        
+        mode = gr.Radio(
+            ["关键词搜索", "直接粘贴正文"],
+            value="关键词搜索",
+            label="获取方式",
+            scale=2,
+        )
+        source = gr.Textbox(
+            label="关键词",
+            placeholder="例如：在职考公 上岸经验",
+            scale=3,
+        )
+
+    fetch_btn = gr.Button("① 获取帖子", variant="secondary")
+
+    post_info = gr.Markdown("_尚未获取帖子_")
+    post_text = gr.Textbox(
+        label="帖子正文（可手动编辑，诊断以这里为准）",
+        lines=14,
+        max_lines=24,
+        buttons=["copy"],
+    )
+    candidates_md = gr.Markdown("")
+
+    gr.Markdown("---\n### ③ 诊断")
+    btn = gr.Button("🚀 诊断这条经验适不适合我", variant="primary")
     output = gr.Markdown(label="适用性诊断卡片")
-    
-    # 【关键升级】：把 goal（下拉框的值）传给 fetch_zhihu_post
-    fetch_btn.click(fn=fetch_zhihu_post, inputs=[goal], outputs=post_text)
-    btn.click(diagnose, inputs=[identity, constraint, goal, post_text], outputs=output)
+
+    # 切换获取方式时，联动输入框的显隐与提示
+    def on_mode(m):
+        if m == "直接粘贴正文":
+            return (
+                gr.update(visible=False),
+                gr.update(visible=False),
+                "### 直接粘贴\n把帖子正文粘到下面的大框，然后点「诊断」。",
+            )
+        return (
+            gr.update(visible=True, label="关键词", placeholder="例如：在职考公 上岸经验"),
+            gr.update(visible=True),
+            "_填关键词后点「获取帖子」_",
+        )
+
+    mode.change(on_mode, inputs=mode, outputs=[source, fetch_btn, post_info])
+
+    def on_fetch(m, src, current):
+        src = (src or "").strip()
+        if m == "直接粘贴正文":
+            return "_已切到粘贴模式：直接把正文粘到下方大框_", current, ""
+        if not src:
+            return "### ⚠️ 先填关键词", current, ""
+
+        try:
+            cands = zhihu_candidates(src)
+            best = cands[0]
+            info = (
+                f"### ✅ 已获取 {len(cands)} 条候选，自动选最长的一条\n"
+                f"**标题**：{best['title'] or '（该条结果无标题字段）'}　·　"
+                f"**字数**：{len(best['text'])}　·　**关键词**：{src}"
+            )
+            rows = "\n".join(
+                f"| {i + 1} | {len(c['text'])} | {c['title'] or '（无标题）'} | "
+                f"{(c['text'][:40] + '…') if c['text'] else '（空）'} |"
+                for i, c in enumerate(cands)
+            )
+            table = "#### 候选列表（点选逻辑后续可加，目前自动取最长的）\n| # | 字数 | 标题 | 开头 |\n|---|---|---|---|\n" + rows
+            return info, best["text"], table
+        except Exception as e:
+            return (f"### ❌ 获取失败\n{e}\n\n可以切到「直接粘贴正文」手动粘贴。",
+                    current, "")
+
+    fetch_btn.click(on_fetch, inputs=[mode, source, post_text],
+                    outputs=[post_info, post_text, candidates_md])
+
+    btn.click(diagnose, inputs=[identity, goal, constraint, post_text], outputs=output)
+
 
 if __name__ == "__main__":
-    demo.queue() # 【新增】开启队列，防止连点，自动显示转圈
-    demo.launch()
+    demo.queue()
+    demo.launch(theme=gr.themes.Soft())
