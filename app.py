@@ -281,7 +281,15 @@ def diagnose(identity, goal, constraint, post_text, demo=False):
     """生成器：先出提示，再出结果；任何异常路径都必须有输出。"""
     post = (post_text or "").strip()
     if not post:
-        yield html_error("还没有帖子正文。先点「① 获取帖子」，或直接把正文粘到下面的大框里。")
+        yield html_error(
+            "还没有帖子正文。先在左侧点「① 获取帖子」，或把正文粘到左下方的大框里。"
+        )
+        return
+    if not (constraint or "").strip():
+        yield html_error(
+            "「核心约束」还空着。这条经验适不适合你，全靠它来判断——"
+            "例如「每天只能下班后学 3 小时」「没有经济支持」。"
+        )
         return
 
     truncated = len(post) > MAX_POST_CHARS
@@ -414,6 +422,12 @@ with gr.Blocks(title="经验尺", fill_width=True) as demo:
                 buttons=["copy"],
             )
             candidates_md = gr.Markdown("")
+            cand_picker = gr.Radio(
+                choices=[],
+                label="候选列表（点一条即可替换下方正文）",
+                visible=False,
+            )
+            cand_state = gr.State([])
 
         # ---------------- 右栏：诊断结果 ----------------
         with gr.Column(scale=14, min_width=460):
@@ -450,33 +464,74 @@ with gr.Blocks(title="经验尺", fill_width=True) as demo:
     mode.change(on_mode, inputs=mode, outputs=[source, fetch_btn, post_info])
 
     def on_fetch(m, src, current):
+        empty_picker = gr.update(choices=[], value=None, visible=False)
         src = (src or "").strip()
         if m == "直接粘贴正文":
-            return "_已切到粘贴模式：直接把正文粘到下方大框_", current, ""
+            return (
+                "_已切到粘贴模式：直接把正文粘到下方大框_",
+                current,
+                [],
+                empty_picker,
+                "",
+            )
         if not src:
-            return "### ⚠️ 先填关键词", current, ""
+            return "### ⚠️ 先填关键词", current, [], empty_picker, ""
 
         try:
             cands = zhihu_candidates(src)
             best = cands[0]
-            info = (
-                f"### ✅ 已获取 {len(cands)} 条候选，自动选最长的一条\n"
-                f"**标题**：{best['title'] or '（该条结果无标题字段）'}　·　"
-                f"**字数**：{len(best['text'])}　·　**关键词**：{src}"
-            )
-            rows = "\n".join(
-                f"| {i + 1} | {len(c['text'])} | {c['title'] or '（无标题）'} | "
-                f"{(c['text'][:40] + '…') if c['text'] else '（空）'} |"
+            labels = [
+                "{} {}{}（{} 字）".format(
+                    str(i + 1) + ".",
+                    (c["title"] or "（无标题）")[:26],
+                    "…" if len(c["title"] or "") > 26 else "",
+                    len(c["text"]),
+                )
                 for i, c in enumerate(cands)
+            ]
+            info = (
+                "### ✅ 已获取 {} 条候选\n".format(len(cands))
+                + "默认载入最长的一条：**{}**（{} 字）\n\n"
+                "想换的话，在下方候选列表里点一条。".format(
+                    (best["title"] or "（无标题）")[:40], len(best["text"])
+                )
             )
-            table = "#### 候选列表（点选逻辑后续可加，目前自动取最长的）\n| # | 字数 | 标题 | 开头 |\n|---|---|---|---|\n" + rows
-            return info, best["text"], table
+            return (
+                info,
+                best["text"],
+                cands,
+                gr.update(choices=labels, value=labels[0], visible=True),
+                "",
+            )
         except Exception as e:
-            return (f"### ❌ 获取失败\n{e}\n\n可以切到「直接粘贴正文」手动粘贴。",
-                    current, "")
+            return (
+                "### ❌ 获取失败\n{}\n\n可以切到「直接粘贴正文」手动粘贴。".format(e),
+                current,
+                [],
+                empty_picker,
+                "",
+            )
 
-    fetch_btn.click(on_fetch, inputs=[mode, source, post_text],
-                    outputs=[post_info, post_text, candidates_md])
+    def on_pick_candidate(label, cands):
+        if not label or not cands:
+            return gr.update()
+        try:
+            idx = int(str(label).split(".")[0]) - 1
+        except Exception:
+            return gr.update()
+        if 0 <= idx < len(cands):
+            return cands[idx]["text"]
+        return gr.update()
+
+    cand_picker.change(
+        on_pick_candidate, inputs=[cand_picker, cand_state], outputs=post_text
+    )
+
+    fetch_btn.click(
+        on_fetch,
+        inputs=[mode, source, post_text],
+        outputs=[post_info, post_text, cand_state, cand_picker, candidates_md],
+    )
 
     def on_load_case(goal):
         case = pick_case(goal)
@@ -501,7 +556,21 @@ with gr.Blocks(title="经验尺", fill_width=True) as demo:
         outputs=[identity, constraint, post_text, post_info],
     )
 
-    btn.click(diagnose, inputs=[identity, goal, constraint, post_text, demo_toggle], outputs=output)
+    def _btn_busy():
+        return gr.update(interactive=False, value="⏳ 正在诊断，请稍候…")
+
+    def _btn_idle():
+        return gr.update(interactive=True, value="🚀 诊断这条经验适不适合我")
+
+    (
+        btn.click(_btn_busy, outputs=btn, queue=False)
+        .then(
+            diagnose,
+            inputs=[identity, goal, constraint, post_text, demo_toggle],
+            outputs=output,
+        )
+        .then(_btn_idle, outputs=btn, queue=False)
+    )
 
 
 if __name__ == "__main__":
