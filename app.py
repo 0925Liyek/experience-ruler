@@ -13,7 +13,12 @@ import gradio as gr
 import requests
 from dotenv import load_dotenv
 
-from ui_cards import html_error, html_loading, html_report
+from ui_cards import (
+    html_error,
+    html_loading,
+    html_placeholder,
+    html_report,
+)
 from prompt import SYSTEM_PROMPT, build_user_message
 
 load_dotenv()
@@ -332,57 +337,67 @@ with gr.Blocks(title="经验尺") as demo:
             "> 想先看完整效果：勾选下方「演示模式」。"
         )
 
-    with gr.Row():
-        identity = free_select(["大三", "大四", "毕业1-3年", "在职"], "在职", "你的身份（可直接输入）")
-        goal = free_select(["考公", "考研", "转行", "求职"], "考公", "你的目标（可直接输入）")
+    with gr.Row(equal_height=False):
+        # ---------------- 左栏：输入 ----------------
+        with gr.Column(scale=11, min_width=380):
+            with gr.Row():
+                identity = free_select(
+                    ["大三", "大四", "毕业1-3年", "在职"], "在职", "你的身份（可直接输入）"
+                )
+                goal = free_select(
+                    ["考公", "考研", "转行", "求职"], "考公", "你的目标（可直接输入）"
+                )
 
-    constraint = gr.Textbox(
-        label="你的核心约束",
-        lines=2,
-        placeholder="例如：只能在职备考 / 本科双非 / 必须自己赚生活费",
-        value="每天只能下班后学 3 小时，没有经济支持",
-    )
+            constraint = gr.Textbox(
+                label="你的核心约束",
+                lines=2,
+                placeholder="例如：只能在职备考 / 本科双非 / 必须自己赚生活费",
+                value="每天只能下班后学 3 小时，没有经济支持",
+            )
 
-    gr.Markdown("---\n### ② 取一条经验帖")
+            gr.Markdown("### ② 取一条经验帖")
 
-    with gr.Row():
-        mode = gr.Radio(
-            ["关键词搜索", "直接粘贴正文"],
-            value="关键词搜索",
-            label="获取方式",
-            scale=2,
-        )
-        source = gr.Textbox(
-            label="关键词",
-            placeholder="例如：在职考公 上岸经验",
-            scale=3,
-        )
+            with gr.Row():
+                mode = gr.Radio(
+                    ["关键词搜索", "直接粘贴正文"],
+                    value="关键词搜索",
+                    label="获取方式",
+                    scale=2,
+                )
+                source = gr.Textbox(
+                    label="关键词",
+                    placeholder="例如：在职考公 上岸经验",
+                    scale=3,
+                )
 
-    fetch_btn = gr.Button("① 获取帖子", variant="secondary")
+            fetch_btn = gr.Button("① 获取帖子", variant="secondary")
 
-    post_info = gr.Markdown("_尚未获取帖子_")
-    post_text = gr.Textbox(
-        label="帖子正文（可手动编辑，诊断以这里为准）",
-        lines=14,
-        max_lines=24,
-        buttons=["copy"],
-    )
-    candidates_md = gr.Markdown("")
+            post_info = gr.Markdown("_尚未获取帖子_")
+            post_text = gr.Textbox(
+                label="帖子正文（可手动编辑，诊断以这里为准）",
+                lines=10,
+                max_lines=18,
+                buttons=["copy"],
+            )
+            candidates_md = gr.Markdown("")
 
-    gr.Markdown("---\n### ③ 诊断")
+        # ---------------- 右栏：诊断结果 ----------------
+        with gr.Column(scale=14, min_width=460):
+            gr.Markdown("### ③ 诊断结果")
 
-    with gr.Row():
-        demo_toggle = gr.Checkbox(
-            label="演示模式（不联网，直接用本地案例）",
-            value=DEMO_MODE,
-            scale=1,
-        )
-        load_case_btn = gr.Button(
-            "📂 载入当前「目标」对应的演示案例", variant="secondary", scale=2
-        )
+            with gr.Row():
+                demo_toggle = gr.Checkbox(
+                    label="演示模式",
+                    info="不联网，直接用本地案例",
+                    value=DEMO_MODE,
+                    scale=1,
+                )
+                load_case_btn = gr.Button(
+                    "📂 载入演示案例", variant="secondary", scale=1
+                )
 
-    btn = gr.Button("🚀 诊断这条经验适不适合我", variant="primary")
-    output = gr.HTML()
+            btn = gr.Button("🚀 诊断这条经验适不适合我", variant="primary", size="lg")
+            output = gr.HTML(value=html_placeholder())
 
     # 切换获取方式时，联动输入框的显隐与提示
     def on_mode(m):

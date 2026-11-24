@@ -195,3 +195,16 @@ def html_error(msg):
         f'<div style="font-size:14px;color:#b91c1c;font-weight:600">⚠️ {_e(str(msg))}</div>'
         "</div>"
     )
+
+
+def html_placeholder():
+    """右侧还没出结果时的空态。"""
+    return (
+        '<div class="yj" style="text-align:center;padding:56px 24px;border-style:dashed">'
+        '<div style="font-size:34px;margin-bottom:10px">📏</div>'
+        '<div style="font-size:15px;font-weight:600;color:#12314f">'
+        "左侧填好处境、取一条经验帖，然后点「诊断」</div>"
+        '<div style="font-size:13px;color:#8a94a0;margin-top:8px">'
+        "这里会出现：隐性前提清单 · 适用性四象限 · 你该去查证的那件事</div>"
+        "</div>"
+    )
