@@ -575,4 +575,11 @@ with gr.Blocks(title="经验尺", fill_width=True) as demo:
 
 if __name__ == "__main__":
     demo.queue()
-    demo.launch(theme=APP_THEME, css=APP_CSS)
+    _kw = dict(theme=APP_THEME, css=APP_CSS)
+    # 云平台需要监听 0.0.0.0；本地仍然只监听 127.0.0.1
+    if os.getenv("MODELSCOPE_ENVIRONMENT") or os.getenv("SPACE_ID"):
+        _kw.update(
+            server_name="0.0.0.0",
+            server_port=int(os.getenv("PORT", "7860")),
+        )
+    demo.launch(**_kw)
