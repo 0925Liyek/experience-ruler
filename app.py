@@ -13,6 +13,8 @@ import gradio as gr
 import requests
 from dotenv import load_dotenv
 
+from ui_cards import html_error, html_loading, html_report
+
 load_dotenv()
 
 ZHIHU_SECRET = os.getenv("ZHIHU_ACCESS_SECRET", "")
@@ -238,6 +240,29 @@ def render_report(d, truncated=False, source=""):
     return "\n".join(lines)
 
 
+# ---------- 演示案例库（B 维护） ----------
+CASES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "cases.json")
+
+
+def load_cases():
+    try:
+        with open(CASES_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+CASES = load_cases()
+
+
+def pick_case(goal):
+    """按目标挑演示案例；找不到就退回第一个。"""
+    for _, v in CASES.items():
+        if goal and (v.get("goal") == goal or v.get("label") == goal):
+            return v
+    return next(iter(CASES.values()), None)
+
+
 # 内置兜底样例（B 可以把这里替换成 3 个固定演示案例）
 FALLBACK_REPORT = {
     "score": 45,
@@ -257,36 +282,39 @@ FALLBACK_REPORT = {
 }
 
 
-def diagnose(identity, goal, constraint, post_text):
+def diagnose(identity, goal, constraint, post_text, demo=False):
     """生成器：先出提示，再出结果；任何异常路径都必须有输出。"""
     post = (post_text or "").strip()
     if not post:
-        yield "⚠️ 还没有帖子正文。先点「① 获取帖子」，或直接把正文粘到下面的大框里。"
+        yield html_error("还没有帖子正文。先点「① 获取帖子」，或直接把正文粘到下面的大框里。")
         return
 
     truncated = len(post) > MAX_POST_CHARS
     post_for_model = post[:MAX_POST_CHARS]
 
-    yield ("⏳ **正在提取隐性前提，并逐条比对你的处境……**\n\n"
-           "通常 5–10 秒，请不要重复点击。")
+    yield html_loading()
 
+    use_demo = bool(demo) or DEMO_MODE
     try:
-        if DEMO_MODE:
-            raise RuntimeError("DEMO_MODE 已开启，跳过真实调用")
-        raw = call_deepseek(SYSTEM_PROMPT, build_user_message(identity, goal, constraint, post_for_model))
+        if use_demo:
+            raise RuntimeError("演示模式：跳过真实调用")
+        raw = call_deepseek(
+            SYSTEM_PROMPT, build_user_message(identity, goal, constraint, post_for_model)
+        )
         data = _parse_json(raw)
         if not data:
             raise ValueError("模型没有返回合法 JSON")
         _cache_save(data)
-        yield render_report(data, truncated, "模型实时诊断")
+        yield html_report(data, source="模型实时诊断 · DeepSeek", truncated=truncated)
     except Exception as e:
-        cached = _cache_load()
-        if cached:
-            yield render_report(cached, truncated, f"⚠️ 实时诊断失败（{e}），已回退到上一次成功结果")
+        case = pick_case(goal) or {}
+        label = case.get("label") or "内置示例"
+        report = case.get("report") or FALLBACK_REPORT
+        if use_demo:
+            src = f"本地演示数据 · {label}"
         else:
-            yield render_report(FALLBACK_REPORT, truncated, f"⚠️ 实时诊断失败（{e}），已回退到内置示例")
-
-
+            src = f"⚠️ 实时诊断失败（{e}），已回退到「{label}」"
+        yield html_report(report, source=src, truncated=truncated, demo=True)
 # ============================================================
 # 3. 界面（Gradio 6：theme 走 launch，Textbox 复制按钮用 buttons=["copy"]）
 # ============================================================
@@ -340,8 +368,19 @@ with gr.Blocks(title="经验尺") as demo:
     candidates_md = gr.Markdown("")
 
     gr.Markdown("---\n### ③ 诊断")
+
+    with gr.Row():
+        demo_toggle = gr.Checkbox(
+            label="演示模式（不联网，直接用本地案例）",
+            value=DEMO_MODE,
+            scale=1,
+        )
+        load_case_btn = gr.Button(
+            "📂 载入当前「目标」对应的演示案例", variant="secondary", scale=2
+        )
+
     btn = gr.Button("🚀 诊断这条经验适不适合我", variant="primary")
-    output = gr.Markdown(label="适用性诊断卡片")
+    output = gr.HTML()
 
     # 切换获取方式时，联动输入框的显隐与提示
     def on_mode(m):
@@ -388,7 +427,30 @@ with gr.Blocks(title="经验尺") as demo:
     fetch_btn.click(on_fetch, inputs=[mode, source, post_text],
                     outputs=[post_info, post_text, candidates_md])
 
-    btn.click(diagnose, inputs=[identity, goal, constraint, post_text], outputs=output)
+    def on_load_case(goal):
+        case = pick_case(goal)
+        if not case:
+            return (
+                gr.update(),
+                gr.update(),
+                "",
+                "### ⚠️ 没读到 fixtures/cases.json，检查文件是否存在",
+            )
+        label = case.get("label", "")
+        return (
+            gr.update(value=case.get("identity") or ""),
+            gr.update(value=case.get("constraint") or ""),
+            case.get("post", ""),
+            f"### ✅ 已载入演示案例：{label}",
+        )
+
+    load_case_btn.click(
+        on_load_case,
+        inputs=[goal],
+        outputs=[identity, constraint, post_text, post_info],
+    )
+
+    btn.click(diagnose, inputs=[identity, goal, constraint, post_text, demo_toggle], outputs=output)
 
 
 if __name__ == "__main__":
