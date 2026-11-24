@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """经验尺 · MVP（Gradio 6 适配版）
 运行：py app.py
 配置：复制 .env.example 为 .env，填入两个 Key
@@ -318,7 +318,41 @@ def free_select(choices, value, label):
     return gr.Dropdown(choices=choices, value=value, label=label, allow_custom_value=True)
 
 
-with gr.Blocks(title="经验尺") as demo:
+# ============================================================
+# 2.5 外观：主题 / 全宽 / 字号（B 维护）
+# ============================================================
+APP_THEME = gr.themes.Soft(
+    primary_hue="blue",
+    neutral_hue="slate",
+    font=["system-ui", "-apple-system", "Segoe UI", "Microsoft YaHei", "sans-serif"],
+).set(
+    body_background_fill="#f4f6f9",
+    block_background_fill="#ffffff",
+    block_border_color="#e3e8ef",
+    body_text_color="#1a1a1a",
+    button_primary_background_fill="#1f4e79",
+    button_primary_background_fill_hover="#173d5f",
+    button_primary_text_color="#ffffff",
+    button_secondary_background_fill="#eef2f7",
+    button_secondary_text_color="#28425c",
+    input_background_fill="#ffffff",
+    input_border_color="#d8dfe8",
+)
+
+APP_CSS = """
+/* 去掉默认内容区宽度限制，让分栏撑满屏幕 */
+.gradio-container{max-width:100%!important;padding:0 28px!important}
+/* 超宽屏兜底，避免一行拉得过长 */
+@media (min-width:1700px){.gradio-container{max-width:1640px!important;margin:0 auto!important}}
+/* 投屏可读性：整体字号提一档 */
+.gradio-container{font-size:16px}
+.gradio-container .prose p,.gradio-container .prose li{font-size:15px;line-height:1.7}
+/* 隐藏 Gradio 自带的页脚 */
+footer{display:none!important}
+"""
+
+
+with gr.Blocks(title="经验尺", fill_width=True) as demo:
     gr.Markdown(
         "# 📏 经验尺\n"
         "**不问「这条经验好不好」，只问「它成立的前提，你符不符合」。**\n\n"
@@ -472,4 +506,4 @@ with gr.Blocks(title="经验尺") as demo:
 
 if __name__ == "__main__":
     demo.queue()
-    demo.launch(theme=gr.themes.Soft())
+    demo.launch(theme=APP_THEME, css=APP_CSS)
