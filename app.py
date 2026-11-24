@@ -22,7 +22,13 @@ DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 
 ZHIHU_HOST = "https://developer.zhihu.com"
 ZHIHU_SEARCH_PATH = "/api/v1/content/zhihu_search"
-DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
+
+# ---- 大模型：任何 OpenAI 兼容接口都能用（默认 DeepSeek）----
+LLM_BASE_URL = (os.getenv("LLM_BASE_URL") or "https://api.deepseek.com").rstrip("/")
+LLM_MODEL = os.getenv("LLM_MODEL") or "deepseek-chat"
+LLM_KEY = os.getenv("LLM_API_KEY") or DEEPSEEK_KEY
+LLM_JSON_MODE = os.getenv("LLM_JSON_MODE", "1") == "1"
+DEEPSEEK_URL = LLM_BASE_URL + "/chat/completions"
 
 CONNECT_TIMEOUT = 5       # 连接超时（秒）
 READ_TIMEOUT = 45         # 读取超时（秒）—— 现场卡死的第一元凶就是不设它
@@ -172,27 +178,33 @@ def build_user_message(identity, goal, constraint, post):
 
 
 def call_deepseek(system_prompt, user_message, retries=1):
-    if not DEEPSEEK_KEY:
-        raise RuntimeError("没读到 DEEPSEEK_API_KEY（检查 .env 是否存在且格式正确）")
+    if not LLM_KEY:
+        raise RuntimeError("没读到模型 Key（检查 .env 里的 DEEPSEEK_API_KEY 或 LLM_API_KEY）")
 
     data = {
-        "model": "deepseek-chat",
+        "model": LLM_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ],
         "temperature": 0.2,
-        "response_format": {"type": "json_object"},
     }
-    headers = {"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"}
+    if LLM_JSON_MODE:
+        data["response_format"] = {"type": "json_object"}
+    headers = {"Authorization": f"Bearer {LLM_KEY}", "Content-Type": "application/json"}
 
     last_err = None
     for attempt in range(retries + 1):
         try:
             resp = requests.post(DEEPSEEK_URL, headers=headers, json=data,
                                  timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+            if resp.status_code == 400 and "response_format" in data:
+                # 部分供应商不支持 json_object，自动去掉再试一次
+                data.pop("response_format", None)
+                resp = requests.post(DEEPSEEK_URL, headers=headers, json=data,
+                                     timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             if resp.status_code != 200:
-                raise RuntimeError(f"DeepSeek HTTP {resp.status_code}：{resp.text[:150]}")
+                raise RuntimeError(f"模型接口 HTTP {resp.status_code}：{resp.text[:150]}")
             return resp.json()["choices"][0]["message"]["content"]
         except Exception as e:
             last_err = e
@@ -346,8 +358,8 @@ with gr.Blocks(title="经验尺") as demo:
     _missing = []
     if not ZHIHU_SECRET:
         _missing.append("**ZHIHU_ACCESS_SECRET**（知乎帖子抓取不可用）")
-    if not DEEPSEEK_KEY:
-        _missing.append("**DEEPSEEK_API_KEY**（实时诊断不可用）")
+    if not LLM_KEY:
+        _missing.append("**DEEPSEEK_API_KEY / LLM_API_KEY**（实时诊断不可用）")
     if _missing:
         gr.Markdown(
             "> ⚠️ **还缺密钥**：" + "　·　".join(_missing) + "\n"
