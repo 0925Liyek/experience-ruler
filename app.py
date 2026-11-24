@@ -345,14 +345,14 @@ with gr.Blocks(title="经验尺") as demo:
 
     _missing = []
     if not ZHIHU_SECRET:
-        _missing.append("ZHIHU_ACCESS_SECRET")
+        _missing.append("**ZHIHU_ACCESS_SECRET**（知乎帖子抓取不可用）")
     if not DEEPSEEK_KEY:
-        _missing.append("DEEPSEEK_API_KEY")
+        _missing.append("**DEEPSEEK_API_KEY**（实时诊断不可用）")
     if _missing:
         gr.Markdown(
-            "> ⚠️ **未配置密钥**：" + "、".join(_missing) + "\n"
-            "> 抓取帖子与实时诊断会失败；勾选下方「演示模式」仍可完整演示。\n"
-            "> 修复：把 `.env.example` 复制为 `.env`，填入两个 Key 后重启。"
+            "> ⚠️ **还缺密钥**：" + "　·　".join(_missing) + "\n"
+            "> 在 `.env` 里补齐后重启即可。缺哪个只影响哪一项，不影响另一项。\n"
+            "> 想先看完整效果：勾选下方「演示模式」。"
         )
 
     with gr.Row():
