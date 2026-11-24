@@ -105,9 +105,22 @@ def zhihu_candidates(query, count=5):
         raise RuntimeError(f"知乎接口 HTTP {resp.status_code}：{resp.text[:150]}")
 
     payload = resp.json()
-    items = (payload.get("Data") or {}).get("Items") or []
+    data = payload.get("Data")
+    if data is None:
+        code = payload.get("Code")
+        msg = payload.get("Message") or payload.get("Msg") or "接口未返回数据"
+        if not ZHIHU_SECRET:
+            raise RuntimeError(
+                "没读到 ZHIHU_ACCESS_SECRET：项目根目录缺少 .env，或文件里没填值。"
+                f"（接口原话：{msg}）"
+            )
+        raise RuntimeError(
+            f"知乎接口拒绝访问：{msg}（Code={code}）。"
+            "请确认密钥是否有效、是否已过期、额度是否用完。"
+        )
+    items = (data or {}).get("Items") or []
     if not items:
-        raise RuntimeError("知乎返回 0 条结果，换个关键词试试。")
+        raise RuntimeError("接口连上了，但这条关键词返回 0 条。换个更宽泛的词试试。")
 
     out = []
     for it in items:
@@ -329,6 +342,18 @@ with gr.Blocks(title="经验尺") as demo:
         "**不问「这条经验好不好」，只问「它成立的前提，你符不符合」。**\n\n"
         "① 填你的处境 → ② 取一条知乎经验帖 → ③ 拿到隐性前提清单与匹配诊断"
     )
+
+    _missing = []
+    if not ZHIHU_SECRET:
+        _missing.append("ZHIHU_ACCESS_SECRET")
+    if not DEEPSEEK_KEY:
+        _missing.append("DEEPSEEK_API_KEY")
+    if _missing:
+        gr.Markdown(
+            "> ⚠️ **未配置密钥**：" + "、".join(_missing) + "\n"
+            "> 抓取帖子与实时诊断会失败；勾选下方「演示模式」仍可完整演示。\n"
+            "> 修复：把 `.env.example` 复制为 `.env`，填入两个 Key 后重启。"
+        )
 
     with gr.Row():
         identity = free_select(["大三", "大四", "毕业1-3年", "在职"], "在职", "你的身份（可直接输入）")
