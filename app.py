@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """经验尺 · MVP（Gradio 6 适配版）
 运行：py app.py
 配置：复制 .env.example 为 .env，填入两个 Key
@@ -13,6 +13,14 @@ import gradio as gr
 import requests
 from dotenv import load_dotenv
 
+from ui_cards import (
+    html_error,
+    html_loading,
+    html_placeholder,
+    html_report,
+)
+from prompt import SYSTEM_PROMPT, build_user_message
+
 load_dotenv()
 
 ZHIHU_SECRET = os.getenv("ZHIHU_ACCESS_SECRET", "")
@@ -20,7 +28,13 @@ DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 
 ZHIHU_HOST = "https://developer.zhihu.com"
 ZHIHU_SEARCH_PATH = "/api/v1/content/zhihu_search"
-DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
+
+# ---- 大模型：任何 OpenAI 兼容接口都能用（默认 DeepSeek）----
+LLM_BASE_URL = (os.getenv("LLM_BASE_URL") or "https://api.deepseek.com").rstrip("/")
+LLM_MODEL = os.getenv("LLM_MODEL") or "deepseek-chat"
+LLM_KEY = os.getenv("LLM_API_KEY") or DEEPSEEK_KEY
+LLM_JSON_MODE = os.getenv("LLM_JSON_MODE", "1") == "1"
+DEEPSEEK_URL = LLM_BASE_URL + "/chat/completions"
 
 CONNECT_TIMEOUT = 5       # 连接超时（秒）
 READ_TIMEOUT = 45         # 读取超时（秒）—— 现场卡死的第一元凶就是不设它
@@ -103,9 +117,22 @@ def zhihu_candidates(query, count=5):
         raise RuntimeError(f"知乎接口 HTTP {resp.status_code}：{resp.text[:150]}")
 
     payload = resp.json()
-    items = (payload.get("Data") or {}).get("Items") or []
+    data = payload.get("Data")
+    if data is None:
+        code = payload.get("Code")
+        msg = payload.get("Message") or payload.get("Msg") or "接口未返回数据"
+        if not ZHIHU_SECRET:
+            raise RuntimeError(
+                "没读到 ZHIHU_ACCESS_SECRET：项目根目录缺少 .env，或文件里没填值。"
+                f"（接口原话：{msg}）"
+            )
+        raise RuntimeError(
+            f"知乎接口拒绝访问：{msg}（Code={code}）。"
+            "请确认密钥是否有效、是否已过期、额度是否用完。"
+        )
+    items = (data or {}).get("Items") or []
     if not items:
-        raise RuntimeError("知乎返回 0 条结果，换个关键词试试。")
+        raise RuntimeError("接口连上了，但这条关键词返回 0 条。换个更宽泛的词试试。")
 
     out = []
     for it in items:
@@ -120,64 +147,34 @@ def zhihu_candidates(query, count=5):
 # ============================================================
 # 2. 诊断：两段式 Prompt → JSON → 卡片
 # ============================================================
-SYSTEM_PROMPT = """你是「经验尺」的诊断引擎。你的唯一任务：把一条知乎经验帖里【没有明写、但决定这条经验能否成立】的隐性前提挖出来，再逐条比对用户的处境。禁止泛泛评价帖子好坏，禁止复述帖子内容。
-
-第一步：只提取，不评价。从原文提取 3-6 条隐性前提，每条包含：
-- type：时间 / 资金 / 学历 / 地域 / 家庭 / 体力 / 信息差 / 窗口期 / 政策 / 健康（选一个最贴近的）
-- claim：这条经验成立所依赖的隐含条件（≤40字，写成陈述句）
-- evidence：原文中支持它的具体信号（≤50字）；若原文确实没写，就写"原文未提及，由常识推断"
-- if_miss：用户不具备这个条件时，照搬会出现的具体后果（≤40字）
-
-第二步：逐条匹配。用用户的身份/目标/约束判定每条：
-- "满足"：用户处境明确满足
-- "不满足"：明确不满足
-- "未知"：用户没提供相关信息。这是重要结论，不要猜测，不要默认满足。
-并给出 why（≤30字的判断理由）。
-
-第三步：汇总。
-- score：0-100，这条经验对【当前这位用户】的可迁移度
-- verdict：一句话结论，直接说能不能照搬（≤30字）
-- quadrants：reference（可参考）/ caution（需警惕）/ invalid（不适用）/ verify（必须验证），各 1-3 条，每条 ≤40 字
-- must_verify：用户现在就能去查证的一个具体问题（≤40字）
-
-约束：
-1. 原文来自 API 抓取，可能缺排版甚至有截断，请按常理推断真实表达，但不要补造原文没有的事实。
-2. 若帖子明显是软广 / 带货 / 引流，在 verdict 里直接点明。
-3. 只输出 JSON，不要 markdown 代码块，不要任何解释文字。结构：
-{"score":0,"verdict":"","premises":[{"type":"","claim":"","evidence":"","if_miss":"","match":"满足","why":""}],"quadrants":{"reference":[],"caution":[],"invalid":[],"verify":[]},"must_verify":""}"""
-
-
-def build_user_message(identity, goal, constraint, post):
-    return (
-        f"用户身份：{identity}\n"
-        f"用户目标：{goal}\n"
-        f"用户约束：{constraint}\n\n"
-        f"帖子正文（可能不连贯）：\n{post}"
-    )
-
-
 def call_deepseek(system_prompt, user_message, retries=1):
-    if not DEEPSEEK_KEY:
-        raise RuntimeError("没读到 DEEPSEEK_API_KEY（检查 .env 是否存在且格式正确）")
+    if not LLM_KEY:
+        raise RuntimeError("没读到模型 Key（检查 .env 里的 DEEPSEEK_API_KEY 或 LLM_API_KEY）")
 
     data = {
-        "model": "deepseek-chat",
+        "model": LLM_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ],
         "temperature": 0.2,
-        "response_format": {"type": "json_object"},
     }
-    headers = {"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"}
+    if LLM_JSON_MODE:
+        data["response_format"] = {"type": "json_object"}
+    headers = {"Authorization": f"Bearer {LLM_KEY}", "Content-Type": "application/json"}
 
     last_err = None
     for attempt in range(retries + 1):
         try:
             resp = requests.post(DEEPSEEK_URL, headers=headers, json=data,
                                  timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+            if resp.status_code == 400 and "response_format" in data:
+                # 部分供应商不支持 json_object，自动去掉再试一次
+                data.pop("response_format", None)
+                resp = requests.post(DEEPSEEK_URL, headers=headers, json=data,
+                                     timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             if resp.status_code != 200:
-                raise RuntimeError(f"DeepSeek HTTP {resp.status_code}：{resp.text[:150]}")
+                raise RuntimeError(f"模型接口 HTTP {resp.status_code}：{resp.text[:150]}")
             return resp.json()["choices"][0]["message"]["content"]
         except Exception as e:
             last_err = e
@@ -238,6 +235,29 @@ def render_report(d, truncated=False, source=""):
     return "\n".join(lines)
 
 
+# ---------- 演示案例库（B 维护） ----------
+CASES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "cases.json")
+
+
+def load_cases():
+    try:
+        with open(CASES_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+CASES = load_cases()
+
+
+def pick_case(goal):
+    """按目标挑演示案例；找不到就退回第一个。"""
+    for _, v in CASES.items():
+        if goal and (v.get("goal") == goal or v.get("label") == goal):
+            return v
+    return next(iter(CASES.values()), None)
+
+
 # 内置兜底样例（B 可以把这里替换成 3 个固定演示案例）
 FALLBACK_REPORT = {
     "score": 45,
@@ -257,36 +277,47 @@ FALLBACK_REPORT = {
 }
 
 
-def diagnose(identity, goal, constraint, post_text):
+def diagnose(identity, goal, constraint, post_text, demo=False):
     """生成器：先出提示，再出结果；任何异常路径都必须有输出。"""
     post = (post_text or "").strip()
     if not post:
-        yield "⚠️ 还没有帖子正文。先点「① 获取帖子」，或直接把正文粘到下面的大框里。"
+        yield html_error(
+            "还没有帖子正文。先在左侧点「① 获取帖子」，或把正文粘到左下方的大框里。"
+        )
+        return
+    if not (constraint or "").strip():
+        yield html_error(
+            "「核心约束」还空着。这条经验适不适合你，全靠它来判断——"
+            "例如「每天只能下班后学 3 小时」「没有经济支持」。"
+        )
         return
 
     truncated = len(post) > MAX_POST_CHARS
     post_for_model = post[:MAX_POST_CHARS]
 
-    yield ("⏳ **正在提取隐性前提，并逐条比对你的处境……**\n\n"
-           "通常 5–10 秒，请不要重复点击。")
+    yield html_loading()
 
+    use_demo = bool(demo) or DEMO_MODE
     try:
-        if DEMO_MODE:
-            raise RuntimeError("DEMO_MODE 已开启，跳过真实调用")
-        raw = call_deepseek(SYSTEM_PROMPT, build_user_message(identity, goal, constraint, post_for_model))
+        if use_demo:
+            raise RuntimeError("演示模式：跳过真实调用")
+        raw = call_deepseek(
+            SYSTEM_PROMPT, build_user_message(identity, goal, constraint, post_for_model)
+        )
         data = _parse_json(raw)
         if not data:
             raise ValueError("模型没有返回合法 JSON")
         _cache_save(data)
-        yield render_report(data, truncated, "模型实时诊断")
+        yield html_report(data, source="模型实时诊断 · DeepSeek", truncated=truncated)
     except Exception as e:
-        cached = _cache_load()
-        if cached:
-            yield render_report(cached, truncated, f"⚠️ 实时诊断失败（{e}），已回退到上一次成功结果")
+        case = pick_case(goal) or {}
+        label = case.get("label") or "内置示例"
+        report = case.get("report") or FALLBACK_REPORT
+        if use_demo:
+            src = f"本地演示数据 · {label}"
         else:
-            yield render_report(FALLBACK_REPORT, truncated, f"⚠️ 实时诊断失败（{e}），已回退到内置示例")
-
-
+            src = f"⚠️ 实时诊断失败（{e}），已回退到「{label}」"
+        yield html_report(report, source=src, truncated=truncated, demo=True)
 # ============================================================
 # 3. 界面（Gradio 6：theme 走 launch，Textbox 复制按钮用 buttons=["copy"]）
 # ============================================================
@@ -295,53 +326,126 @@ def free_select(choices, value, label):
     return gr.Dropdown(choices=choices, value=value, label=label, allow_custom_value=True)
 
 
-with gr.Blocks(title="经验尺") as demo:
+# ============================================================
+# 2.5 外观：主题 / 全宽 / 字号（B 维护）
+# ============================================================
+APP_THEME = gr.themes.Soft(
+    primary_hue="blue",
+    neutral_hue="slate",
+    font=["system-ui", "-apple-system", "Segoe UI", "Microsoft YaHei", "sans-serif"],
+).set(
+    body_background_fill="#f4f6f9",
+    block_background_fill="#ffffff",
+    block_border_color="#e3e8ef",
+    body_text_color="#1a1a1a",
+    button_primary_background_fill="#1f4e79",
+    button_primary_background_fill_hover="#173d5f",
+    button_primary_text_color="#ffffff",
+    button_secondary_background_fill="#eef2f7",
+    button_secondary_text_color="#28425c",
+    input_background_fill="#ffffff",
+    input_border_color="#d8dfe8",
+)
+
+APP_CSS = """
+/* 去掉默认内容区宽度限制，让分栏撑满屏幕 */
+.gradio-container{max-width:100%!important;padding:0 28px!important}
+/* 超宽屏兜底，避免一行拉得过长 */
+@media (min-width:1700px){.gradio-container{max-width:1640px!important;margin:0 auto!important}}
+/* 投屏可读性：整体字号提一档 */
+.gradio-container{font-size:16px}
+.gradio-container .prose p,.gradio-container .prose li{font-size:15px;line-height:1.7}
+/* 隐藏 Gradio 自带的页脚 */
+footer{display:none!important}
+"""
+
+
+with gr.Blocks(title="经验尺", fill_width=True) as demo:
     gr.Markdown(
         "# 📏 经验尺\n"
         "**不问「这条经验好不好」，只问「它成立的前提，你符不符合」。**\n\n"
         "① 填你的处境 → ② 取一条知乎经验帖 → ③ 拿到隐性前提清单与匹配诊断"
     )
 
-    with gr.Row():
-        identity = free_select(["大三", "大四", "毕业1-3年", "在职"], "在职", "你的身份（可直接输入）")
-        goal = free_select(["考公", "考研", "转行", "求职"], "考公", "你的目标（可直接输入）")
-
-    constraint = gr.Textbox(
-        label="你的核心约束",
-        lines=2,
-        placeholder="例如：只能在职备考 / 本科双非 / 必须自己赚生活费",
-        value="每天只能下班后学 3 小时，没有经济支持",
-    )
-
-    gr.Markdown("---\n### ② 取一条经验帖")
-
-    with gr.Row():
-        mode = gr.Radio(
-            ["关键词搜索", "直接粘贴正文"],
-            value="关键词搜索",
-            label="获取方式",
-            scale=2,
-        )
-        source = gr.Textbox(
-            label="关键词",
-            placeholder="例如：在职考公 上岸经验",
-            scale=3,
+    _missing = []
+    if not ZHIHU_SECRET:
+        _missing.append("**ZHIHU_ACCESS_SECRET**（知乎帖子抓取不可用）")
+    if not LLM_KEY:
+        _missing.append("**DEEPSEEK_API_KEY / LLM_API_KEY**（实时诊断不可用）")
+    if _missing:
+        gr.Markdown(
+            "> ⚠️ **还缺密钥**：" + "　·　".join(_missing) + "\n"
+            "> 在 `.env` 里补齐后重启即可。缺哪个只影响哪一项，不影响另一项。\n"
+            "> 想先看完整效果：勾选下方「演示模式」。"
         )
 
-    fetch_btn = gr.Button("① 获取帖子", variant="secondary")
+    with gr.Row(equal_height=False):
+        # ---------------- 左栏：输入 ----------------
+        with gr.Column(scale=11, min_width=380):
+            with gr.Row():
+                identity = free_select(
+                    ["大三", "大四", "毕业1-3年", "在职"], "在职", "你的身份（可直接输入）"
+                )
+                goal = free_select(
+                    ["考公", "考研", "转行", "求职"], "考公", "你的目标（可直接输入）"
+                )
 
-    post_info = gr.Markdown("_尚未获取帖子_")
-    post_text = gr.Textbox(
-        label="帖子正文（可手动编辑，诊断以这里为准）",
-        lines=14,
-        max_lines=24,
-        buttons=["copy"],
-    )
-    candidates_md = gr.Markdown("")
+            constraint = gr.Textbox(
+                label="你的核心约束",
+                lines=2,
+                placeholder="例如：只能在职备考 / 本科双非 / 必须自己赚生活费",
+                value="每天只能下班后学 3 小时，没有经济支持",
+            )
 
-    gr.Markdown("---\n### ③ 诊断")
-    btn = gr.Button("🚀 诊断这条经验适不适合我", variant="primary")
-    output = gr.Markdown(label="适用性诊断卡片")
+            gr.Markdown("### ② 取一条经验帖")
+
+            with gr.Row():
+                mode = gr.Radio(
+                    ["关键词搜索", "直接粘贴正文"],
+                    value="关键词搜索",
+                    label="获取方式",
+                    scale=2,
+                )
+                source = gr.Textbox(
+                    label="关键词",
+                    placeholder="例如：在职考公 上岸经验",
+                    scale=3,
+                )
+
+            fetch_btn = gr.Button("① 获取帖子", variant="secondary")
+
+            post_info = gr.Markdown("_尚未获取帖子_")
+            post_text = gr.Textbox(
+                label="帖子正文（可手动编辑，诊断以这里为准）",
+                lines=10,
+                max_lines=18,
+                buttons=["copy"],
+            )
+            candidates_md = gr.Markdown("")
+            cand_picker = gr.Radio(
+                choices=[],
+                label="候选列表（点一条即可替换下方正文）",
+                visible=False,
+            )
+            cand_state = gr.State([])
+
+        # ---------------- 右栏：诊断结果 ----------------
+        with gr.Column(scale=14, min_width=460):
+            gr.Markdown("### ③ 诊断结果")
+
+            with gr.Row():
+                demo_toggle = gr.Checkbox(
+                    label="演示模式",
+                    info="不联网，直接用本地案例",
+                    value=DEMO_MODE,
+                    scale=1,
+                )
+                load_case_btn = gr.Button(
+                    "📂 载入演示案例", variant="secondary", scale=1
+                )
+
+            btn = gr.Button("🚀 诊断这条经验适不适合我", variant="primary", size="lg")
+            output = gr.HTML(value=html_placeholder())
 
     # 切换获取方式时，联动输入框的显隐与提示
     def on_mode(m):
@@ -360,37 +464,122 @@ with gr.Blocks(title="经验尺") as demo:
     mode.change(on_mode, inputs=mode, outputs=[source, fetch_btn, post_info])
 
     def on_fetch(m, src, current):
+        empty_picker = gr.update(choices=[], value=None, visible=False)
         src = (src or "").strip()
         if m == "直接粘贴正文":
-            return "_已切到粘贴模式：直接把正文粘到下方大框_", current, ""
+            return (
+                "_已切到粘贴模式：直接把正文粘到下方大框_",
+                current,
+                [],
+                empty_picker,
+                "",
+            )
         if not src:
-            return "### ⚠️ 先填关键词", current, ""
+            return "### ⚠️ 先填关键词", current, [], empty_picker, ""
 
         try:
             cands = zhihu_candidates(src)
             best = cands[0]
-            info = (
-                f"### ✅ 已获取 {len(cands)} 条候选，自动选最长的一条\n"
-                f"**标题**：{best['title'] or '（该条结果无标题字段）'}　·　"
-                f"**字数**：{len(best['text'])}　·　**关键词**：{src}"
-            )
-            rows = "\n".join(
-                f"| {i + 1} | {len(c['text'])} | {c['title'] or '（无标题）'} | "
-                f"{(c['text'][:40] + '…') if c['text'] else '（空）'} |"
+            labels = [
+                "{} {}{}（{} 字）".format(
+                    str(i + 1) + ".",
+                    (c["title"] or "（无标题）")[:26],
+                    "…" if len(c["title"] or "") > 26 else "",
+                    len(c["text"]),
+                )
                 for i, c in enumerate(cands)
+            ]
+            info = (
+                "### ✅ 已获取 {} 条候选\n".format(len(cands))
+                + "默认载入最长的一条：**{}**（{} 字）\n\n"
+                "想换的话，在下方候选列表里点一条。".format(
+                    (best["title"] or "（无标题）")[:40], len(best["text"])
+                )
             )
-            table = "#### 候选列表（点选逻辑后续可加，目前自动取最长的）\n| # | 字数 | 标题 | 开头 |\n|---|---|---|---|\n" + rows
-            return info, best["text"], table
+            return (
+                info,
+                best["text"],
+                cands,
+                gr.update(choices=labels, value=labels[0], visible=True),
+                "",
+            )
         except Exception as e:
-            return (f"### ❌ 获取失败\n{e}\n\n可以切到「直接粘贴正文」手动粘贴。",
-                    current, "")
+            return (
+                "### ❌ 获取失败\n{}\n\n可以切到「直接粘贴正文」手动粘贴。".format(e),
+                current,
+                [],
+                empty_picker,
+                "",
+            )
 
-    fetch_btn.click(on_fetch, inputs=[mode, source, post_text],
-                    outputs=[post_info, post_text, candidates_md])
+    def on_pick_candidate(label, cands):
+        if not label or not cands:
+            return gr.update()
+        try:
+            idx = int(str(label).split(".")[0]) - 1
+        except Exception:
+            return gr.update()
+        if 0 <= idx < len(cands):
+            return cands[idx]["text"]
+        return gr.update()
 
-    btn.click(diagnose, inputs=[identity, goal, constraint, post_text], outputs=output)
+    cand_picker.change(
+        on_pick_candidate, inputs=[cand_picker, cand_state], outputs=post_text
+    )
+
+    fetch_btn.click(
+        on_fetch,
+        inputs=[mode, source, post_text],
+        outputs=[post_info, post_text, cand_state, cand_picker, candidates_md],
+    )
+
+    def on_load_case(goal):
+        case = pick_case(goal)
+        if not case:
+            return (
+                gr.update(),
+                gr.update(),
+                "",
+                "### ⚠️ 没读到 fixtures/cases.json，检查文件是否存在",
+            )
+        label = case.get("label", "")
+        return (
+            gr.update(value=case.get("identity") or ""),
+            gr.update(value=case.get("constraint") or ""),
+            case.get("post", ""),
+            f"### ✅ 已载入演示案例：{label}",
+        )
+
+    load_case_btn.click(
+        on_load_case,
+        inputs=[goal],
+        outputs=[identity, constraint, post_text, post_info],
+    )
+
+    def _btn_busy():
+        return gr.update(interactive=False, value="⏳ 正在诊断，请稍候…")
+
+    def _btn_idle():
+        return gr.update(interactive=True, value="🚀 诊断这条经验适不适合我")
+
+    (
+        btn.click(_btn_busy, outputs=btn, queue=False)
+        .then(
+            diagnose,
+            inputs=[identity, goal, constraint, post_text, demo_toggle],
+            outputs=output,
+        )
+        .then(_btn_idle, outputs=btn, queue=False)
+    )
 
 
 if __name__ == "__main__":
     demo.queue()
-    demo.launch(theme=gr.themes.Soft())
+    _kw = dict(theme=APP_THEME, css=APP_CSS)
+    # 云平台需要监听 0.0.0.0；本地仍然只监听 127.0.0.1
+    if os.getenv("MODELSCOPE_ENVIRONMENT") or os.getenv("SPACE_ID"):
+        _kw.update(
+            server_name="0.0.0.0",
+            server_port=int(os.getenv("PORT", "7860")),
+        )
+    demo.launch(**_kw)
